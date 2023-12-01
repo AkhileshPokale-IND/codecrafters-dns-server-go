@@ -1,200 +1,223 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"strings"
 )
 
-func concatenate(bufs ...[]byte) []byte {
-	var buf []byte
-	for _, b := range bufs {
-		buf = append(buf, b...)
-	}
-	return buf
-}
-
-type Message struct {
-	*Header
-	*Question
-	Responses []*Response
-}
-
-func newMessage(buf []byte) *Message {
-	return &Message{
-		Header:   newHeader(buf[:12]),
-		Question: newQuestion(buf[12:]),
-	}
-}
-func (msg *Message) Marshal() []byte {
-	buf := concatenate(msg.Header.Marshal(), msg.Question.Marshal())
-	for _, response := range msg.Responses {
-		buf = concatenate(buf, response.Marshal())
-	}
-	return buf
-}
+const IPv4Len = 4
 
 type Header struct {
-	ID            uint16
-	QueryResponse bool
-	Opcode        uint16
-
-	AuthoritativeAnswer bool
-	Truncation          bool
-	RecursionDesired    bool
-	RecursionAvailable  bool
-	Z                   uint16
-	RCode               uint16
-	QDCount             uint16
-	ANCount             uint16
-	NSCount             uint16
-	ARCount             uint16
+	ID uint16
+	// Flags contains multiple values:
+	// QR (1 bit) - query/response.
+	// OPCODE (4 bits) - operation code.
+	// AA (1 bit) - if server "owns" queried domain.
+	// TC (1 bit) - if message is larger than 512 bytes. Can be used as indicator of whether TCP should be used.
+	// RD (1 bit) - if recursion is desired. Set by client.
+	// RA (1 bit) - if recursion is available. Set by server.
+	// Z (3 bits) - reserved.
+	// RC (4 bits) - response code and reason in case if request is failed.
+	Flags uint16
+	// QDCount is number of entries in the question section
+	QDCount uint16
+	// ANCount is number of entries in the answer section
+	ANCount uint16
+	// NSCount is number of entries in the authority section
+	NSCount uint16
+	// ARCound is number of entries in the additional section
+	ARCount uint16
 }
 
-func boolToUint16(val bool) uint16 {
-	if val {
-		return 1
-	}
-
-	return 0
-}
-
-func (header *Header) GetFlags() uint16 {
-	var flags uint16
-	flags |= boolToUint16(header.QueryResponse) << 15
-	flags |= header.Opcode << 11
-
-	flags |= boolToUint16(header.AuthoritativeAnswer) << 10
-	flags |= boolToUint16(header.Truncation) << 9
-	flags |= boolToUint16(header.RecursionDesired) << 8
-	flags |= boolToUint16(header.RecursionAvailable) << 7
-	flags |= header.Z << 4
-	flags |= header.RCode << 0
-
-	return flags
-}
-func newHeader(buf []byte) *Header {
-	header := &Header{}
-	fmt.Printf("0: %08b\n", buf[0])
-	fmt.Printf("1: %08b\n", buf[1])
-	fmt.Printf("2: %08b\n", buf[2])
-	fmt.Printf("3: %08b\n", buf[3])
-	header.ID = binary.BigEndian.Uint16(buf[0:2])
-	header.QueryResponse = (buf[2] & (1 << 7)) != 0
-	header.Opcode = uint16((buf[2] >> 3) & 15)
-	header.AuthoritativeAnswer = (buf[2] & (1 << 2)) != 0
-	header.Truncation = (buf[2] & (1 << 1)) != 0
-	header.RecursionDesired = buf[2]&1 != 0
-	header.RecursionAvailable = (buf[3] & (1 << 7)) != 0
-	header.Z = uint16((buf[4] >> 3) & 7)
-	header.RCode = uint16(buf[4] & 15)
-	header.QDCount = binary.BigEndian.Uint16(buf[4:6])
-	header.ANCount = binary.BigEndian.Uint16(buf[6:8])
-	header.NSCount = binary.BigEndian.Uint16(buf[8:10])
-
-	header.ARCount = binary.BigEndian.Uint16(buf[10:12])
-	return header
-}
-func (header *Header) Marshal() []byte {
-	result := make([]byte, 12)
-	binary.BigEndian.PutUint16(result[0:2], header.ID)
-	binary.BigEndian.PutUint16(result[2:4], header.GetFlags())
-	binary.BigEndian.PutUint16(result[4:6], header.QDCount)
-	binary.BigEndian.PutUint16(result[6:8], header.ANCount)
-	binary.BigEndian.PutUint16(result[8:10], header.NSCount)
-	binary.BigEndian.PutUint16(result[10:12], header.ANCount)
-	return result
+type Label struct {
+	Len     byte
+	Content []byte
 }
 
 type Question struct {
-	Name   string
-	QType  uint16
-	QClass uint16
+	Name         []Label
+	QuestionType uint16
+	Class        uint16
 }
 
-func newQuestion(buf []byte) *Question {
-	var name strings.Builder
-	i := 0
-	for {
-		size := int(buf[i])
-		label := buf[i+1 : i+1+size]
-		name.Write(label)
-		name.WriteRune('.')
-		i = i + 1 + size
-		if buf[i] == 0 {
-			break
+type Answer struct {
+	Name       []Label
+	RecordType uint16
+	Class      uint16
+	TTL        uint32
+	Length     uint16
+	Data       uint32 // ATM we only support class "A" record type which means that data will only contain IPv4
+}
+
+type Message struct {
+	Header    Header
+	Questions []Question
+	Answers   []Answer
+}
+
+func (h *Header) SetQR(val bool) {
+	if val {
+		h.Flags |= 1 << 15
+	}
+}
+
+func (h *Header) SetRC(val uint16) {
+	h.Flags |= val
+}
+
+func (h *Header) OpCode() uint16 {
+	return (h.Flags & 0x7800) >> 11
+}
+
+func (m *Message) Encode() ([]byte, error) {
+	buf := &bytes.Buffer{}
+
+	if err := binary.Write(buf, binary.BigEndian, m.Header); err != nil {
+		return nil, fmt.Errorf("can't write header: %w", err)
+	}
+
+	for _, q := range m.Questions {
+		for _, l := range q.Name {
+			if err := buf.WriteByte(l.Len); err != nil {
+				return nil, fmt.Errorf("can't write label's len in question: %w", err)
+			}
+			if _, err := buf.Write(l.Content); err != nil {
+				return nil, fmt.Errorf("can't write label's content in question: %w", err)
+			}
+		}
+		if err := buf.WriteByte('\x00'); err != nil {
+			return nil, fmt.Errorf("can't write terminating byte of name in question: %w", err)
+		}
+
+		typeAndClass := make([]byte, 0, 4)
+		typeAndClass = binary.BigEndian.AppendUint16(typeAndClass, q.QuestionType)
+		typeAndClass = binary.BigEndian.AppendUint16(typeAndClass, q.Class)
+
+		if _, err := buf.Write(typeAndClass); err != nil {
+			return nil, fmt.Errorf("can't write type and class: %w", err)
 		}
 	}
-	return &Question{
-		Name:   name.String(),
-		QType:  binary.BigEndian.Uint16(buf[i+1 : i+3]),
-		QClass: binary.BigEndian.Uint16(buf[i+3 : i+5]),
+
+	for _, a := range m.Answers {
+		for _, l := range a.Name {
+			if err := buf.WriteByte(l.Len); err != nil {
+				return nil, fmt.Errorf("can't write label's len in answer: %w", err)
+			}
+			if _, err := buf.Write(l.Content); err != nil {
+				return nil, fmt.Errorf("can't write label's content in answer: %w", err)
+			}
+		}
+		if err := buf.WriteByte('\x00'); err != nil {
+			return nil, fmt.Errorf("can't write terminating byte of name in answer: %w", err)
+		}
+
+		// restAnswer is the remaining part of answer, excluding name
+		restAnswer := make([]byte, 0, 14)
+		restAnswer = binary.BigEndian.AppendUint16(restAnswer, a.RecordType)
+		restAnswer = binary.BigEndian.AppendUint16(restAnswer, a.Class)
+		restAnswer = binary.BigEndian.AppendUint32(restAnswer, a.TTL)
+		restAnswer = binary.BigEndian.AppendUint16(restAnswer, a.Length)
+		restAnswer = binary.BigEndian.AppendUint32(restAnswer, a.Data)
+
+		if _, err := buf.Write(restAnswer); err != nil {
+			return nil, fmt.Errorf("can't write answer: %w", err)
+		}
 	}
-}
-func (question *Question) Marshal() []byte {
-	var name []byte
-	fields := strings.FieldsFunc(question.Name, func(r rune) bool {
-		return r == '.'
-	})
-	for _, field := range fields {
-		name = concatenate(
-			name,
-			[]byte{byte(len(field))},
-			[]byte(field),
-		)
-	}
-	name = concatenate(
-		name,
-		[]byte{0},
-	)
-	return concatenate(
-		name,
-		uint16ToBytes(question.QType),
-		uint16ToBytes(question.QClass),
-	)
-}
-func uint16ToBytes(val uint16) []byte {
-	buf := make([]byte, 2)
-	binary.BigEndian.PutUint16(buf, val)
-	return buf
-}
-func uint32ToBytes(val uint32) []byte {
-	buf := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf, val)
-	return buf
+
+	return buf.Bytes(), nil
 }
 
-type Response struct {
-	Name     string
-	Type     uint16
-	Class    uint16
-	Ttl      uint32
-	RDLength uint16
-	RData    []byte
-}
+func DecodeMessage(packet []byte) (Message, error) {
+	h := Header{}
 
-func (response *Response) Marshal() []byte {
-	var name []byte
-	fields := strings.FieldsFunc(response.Name, func(r rune) bool {
-		return r == '.'
-	})
-	for _, field := range fields {
-		name = concatenate(
-			name,
-			[]byte{byte(len(field))},
-			[]byte(field),
-		)
+	if len(packet) < 12 {
+		return Message{}, errors.New("malformed packet")
 	}
-	name = concatenate(name, []byte{0x00})
-	var buf []byte
-	buf = concatenate(
-		buf,
-		name,
-		uint16ToBytes(response.Type),
-		uint16ToBytes(response.Class),
-		uint32ToBytes(response.Ttl),
-		uint16ToBytes(response.RDLength),
-		response.RData,
-	)
-	return buf
+
+	h.ID = binary.BigEndian.Uint16(packet[:2])
+	h.Flags = binary.BigEndian.Uint16(packet[2:4])
+	h.QDCount = binary.BigEndian.Uint16(packet[4:6])
+	h.ANCount = binary.BigEndian.Uint16(packet[6:8])
+	h.NSCount = binary.BigEndian.Uint16(packet[8:10])
+	h.ARCount = binary.BigEndian.Uint16(packet[10:12])
+
+	buf := bytes.NewBuffer(packet[12:])
+	qs := make([]Question, 0, h.QDCount)
+
+	for i := 0; i < int(h.QDCount); i++ {
+		q := Question{}
+
+	NameLoop:
+		for {
+			labelLen, err := buf.ReadByte()
+			if err != nil {
+				return Message{}, fmt.Errorf("can't read label's len: %w", err)
+			}
+
+			if labelLen == 0 {
+				break NameLoop
+			}
+
+			if labelLen&192 == 192 { // this is pointer
+				remainingOctet, err := buf.ReadByte()
+				if err != nil {
+					return Message{}, fmt.Errorf("can't read remaining octet of the pointer: %w", err)
+				}
+
+				offset := uint16(labelLen&63)<<8 + uint16(remainingOctet)
+
+				offsetBuf := bytes.NewBuffer(packet[offset:])
+				labelLen, err = offsetBuf.ReadByte()
+				if err != nil {
+					return Message{}, fmt.Errorf("can't read label's len by offset: %w", err)
+				}
+
+				labelContent := make([]byte, labelLen)
+				if read, err := offsetBuf.Read(labelContent); err != nil {
+					return Message{}, fmt.Errorf("can't read label's content by offset: %w", err)
+				} else if read != int(labelLen) {
+					return Message{}, fmt.Errorf("malformed label. expected len to be %d, got %d", labelLen, read)
+				}
+
+				q.Name = append(q.Name, Label{
+					Len:     labelLen,
+					Content: labelContent,
+				})
+
+				continue NameLoop
+			}
+
+			labelContent := make([]byte, labelLen)
+			read, err := buf.Read(labelContent)
+			if err != nil {
+				return Message{}, fmt.Errorf("can't read label's content: %w", err)
+			}
+			if read != int(labelLen) {
+				return Message{}, fmt.Errorf("malformed label. expected len to be %d, got %d", labelLen, read)
+			}
+
+			q.Name = append(q.Name, Label{
+				Len:     labelLen,
+				Content: labelContent,
+			})
+		}
+
+		restQuestion := make([]byte, 4) // question type and class
+		read, err := buf.Read(restQuestion)
+		if err != nil {
+			return Message{}, fmt.Errorf("can't read question's type and class: %w", err)
+		}
+		if read != 4 {
+			return Message{}, errors.New("malformed question")
+		}
+
+		q.QuestionType = binary.BigEndian.Uint16(restQuestion[:2])
+		q.Class = binary.BigEndian.Uint16(restQuestion[2:])
+
+		qs = append(qs, q)
+	}
+
+	return Message{Header: h, Questions: qs}, nil
 }
