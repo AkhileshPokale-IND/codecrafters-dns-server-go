@@ -35,12 +35,15 @@ func main() {
 		}
 
 		receivedData := string(buf[:size])
-		fmt.Printf("Received %d bytes from %s: %s\n", size, source, receivedData)
+		fmt.Printf("Received %d bytes from %s: %v\n", size, source, receivedData)
+		_ = ParseDNSHeader(buf[:12])
 
 		// Create an empty response
-		response := []byte{}
+		// response := []byte{}
+		response := NewDNSHeader(1234, 0, 0, 0, 0, 0)
+		response.SetFlags(1, 0, 0, 0, 0, 0, 0, 0)
 
-		_, err = udpConn.WriteToUDP(response, source)
+		_, err = udpConn.WriteToUDP(response.Dump(), source)
 		if err != nil {
 			fmt.Println("Failed to send response:", err)
 		}
