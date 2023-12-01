@@ -12,6 +12,16 @@ type DNSHeader struct {
 	NSCount uint16
 	ARCount uint16
 }
+type Flags struct {
+	QR     bool
+	OpCode uint8
+	AA     bool
+	TC     bool
+	RD     bool
+	RA     bool
+	Z      uint8
+	RCode  uint8
+}
 
 // DNSHeaderFromBytes returns a DNSHeader with appropriate fields set by their byte numbers
 // Used to turn an incoming request into a usable type
@@ -24,6 +34,19 @@ func DNSHeaderFromBytes(bytes []byte) *DNSHeader {
 		NSCount: binary.BigEndian.Uint16(bytes[8:10]),
 		ARCount: binary.BigEndian.Uint16(bytes[10:12]),
 	}
+}
+func (h *DNSHeader) GetFlags() Flags {
+	return Flags{
+		QR:     h.Flags>>15 == 1,
+		OpCode: uint8(h.Flags >> 11 & 0xF),
+		AA:     h.Flags>>10 == 1,
+		TC:     h.Flags>>9 == 1,
+		RD:     h.Flags>>8 == 1,
+		RA:     h.Flags>>7 == 1,
+		Z:      uint8(h.Flags >> 4 & 0x7),
+		RCode:  uint8(h.Flags & 0xF),
+	}
+
 }
 
 // ToBytes returns a byte slice formed of provided DNSHeader fields
